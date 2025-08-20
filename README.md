@@ -1,1 +1,1 @@
-# safari-project-db
+# safari-project-sql-db
