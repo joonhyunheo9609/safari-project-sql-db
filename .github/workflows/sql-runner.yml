@@ -1,0 +1,399 @@
+# .github/workflows/sql-runner.yml
+# SQLite 데이터베이스를 관리하는 GitHub Actions 워크플로우
+
+name: 🗄️ SQLite Database Runner
+
+on:
+  # Apps Script에서 수동으로 트리거
+  workflow_dispatch:
+    inputs:
+      sql_query:
+        description: 'SQL Query to execute'
+        required: true
+        type: string
+      parameters:
+        description: 'Query parameters (JSON array)'
+        required: false
+        default: '[]'
+        type: string
+      action_type:
+        description: 'Type of action (query/update/init)'
+        required: false
+        default: 'query'
+        type: string
+
+  # 스케줄러 (선택사항 - 매일 자정에 백업)
+  schedule:
+    - cron: '0 0 * * *'  # 매일 UTC 자정
+
+  # Push 이벤트 (db 폴더 변경 시)
+  push:
+    paths:
+      - 'database/**'
+      - '.github/workflows/sql-runner.yml'
+
+jobs:
+  sqlite-operations:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # 1. Repository 체크아웃
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    # 2. SQLite 설치 및 설정
+    - name: 🗄️ Setup SQLite
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y sqlite3
+        sqlite3 --version
+
+    # 3. 데이터베이스 디렉토리 생성
+    - name: 📁 Create Database Directory
+      run: |
+        mkdir -p database
+        mkdir -p results
+        mkdir -p backups
+
+    # 4. 데이터베이스 초기화 (파일이 없는 경우)
+    - name: 🔧 Initialize Database
+      run: |
+        if [ ! -f database/safari_project.db ]; then
+          echo "Creating new SQLite database..."
+          sqlite3 database/safari_project.db << 'EOF'
+        
+        -- Page Requests 테이블
+        CREATE TABLE IF NOT EXISTS page_requests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          priority TEXT,
+          status TEXT,
+          title TEXT UNIQUE NOT NULL,
+          category TEXT,
+          requested_by TEXT,
+          reference_url TEXT,
+          date_requested DATETIME,
+          date_scheduled DATETIME,
+          assigned_to TEXT,
+          date_completed DATETIME,
+          notes TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Weekly Schedule 테이블
+        CREATE TABLE IF NOT EXISTS weekly_schedule (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          week_date DATE,
+          scheduled_date DATETIME,
+          assigned_to TEXT,
+          priority TEXT,
+          status TEXT,
+          row_position INTEGER,
+          column_position INTEGER,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(title, week_date)
+        );
+
+        -- Sync Log 테이블
+        CREATE TABLE IF NOT EXISTS sync_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+          action TEXT NOT NULL,
+          table_name TEXT,
+          title TEXT,
+          details TEXT,
+          success BOOLEAN DEFAULT TRUE
+        );
+
+        -- 인덱스 생성
+        CREATE INDEX IF NOT EXISTS idx_page_requests_title ON page_requests(title);
+        CREATE INDEX IF NOT EXISTS idx_page_requests_status ON page_requests(status);
+        CREATE INDEX IF NOT EXISTS idx_weekly_schedule_title ON weekly_schedule(title);
+        CREATE INDEX IF NOT EXISTS idx_sync_log_timestamp ON sync_log(timestamp);
+
+        -- 초기 로그 추가
+        INSERT INTO sync_log (action, table_name, details) 
+        VALUES ('database_init', 'system', 'Database initialized via GitHub Actions');
+
+        EOF
+          echo "✅ Database initialized successfully"
+        else
+          echo "📊 Database already exists"
+        fi
+
+    # 5. SQL 쿼리 실행 (Apps Script에서 트리거된 경우)
+    - name: 🔍 Execute SQL Query
+      if: github.event.inputs.sql_query != ''
+      run: |
+        echo "Executing SQL Query: ${{ github.event.inputs.sql_query }}"
+        
+        # 파라미터 처리
+        PARAMETERS='${{ github.event.inputs.parameters }}'
+        ACTION_TYPE='${{ github.event.inputs.action_type }}'
+        
+        # 결과 파일 경로
+        RESULT_FILE="results/latest_query_result.json"
+        
+        # SQL 쿼리 실행 및 결과를 JSON으로 저장
+        echo "Starting SQL execution..."
+        
+        # SQLite에서 JSON 형태로 결과 추출하는 스크립트 생성
+        cat > execute_query.py << 'EOF'
+        import sqlite3
+        import json
+        import sys
+        from datetime import datetime
+
+        def execute_query(db_path, query, parameters_json):
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
+                cursor = conn.cursor()
+                
+                # 파라미터 파싱
+                parameters = json.loads(parameters_json) if parameters_json else []
+                
+                # 쿼리 실행
+                if parameters:
+                    cursor.execute(query, parameters)
+                else:
+                    cursor.execute(query)
+                
+                # 결과 처리
+                if query.strip().upper().startswith('SELECT'):
+                    # SELECT 쿼리 - 결과 반환
+                    rows = cursor.fetchall()
+                    result = [dict(row) for row in rows]
+                else:
+                    # INSERT/UPDATE/DELETE - 영향받은 행 수 반환
+                    conn.commit()
+                    result = {"affected_rows": cursor.rowcount, "lastrowid": cursor.lastrowid}
+                
+                conn.close()
+                
+                # 결과를 JSON 파일로 저장
+                output = {
+                    "success": True,
+                    "result": result,
+                    "query": query,
+                    "parameters": parameters,
+                    "timestamp": datetime.now().isoformat(),
+                    "row_count": len(result) if isinstance(result, list) else 1
+                }
+                
+                with open("results/latest_query_result.json", "w") as f:
+                    json.dump(output, f, indent=2)
+                
+                print(f"✅ Query executed successfully. Results saved to JSON.")
+                print(f"📊 Rows affected/returned: {len(result) if isinstance(result, list) else result.get('affected_rows', 0)}")
+                
+            except Exception as e:
+                # 오류 결과 저장
+                error_output = {
+                    "success": False,
+                    "error": str(e),
+                    "query": query,
+                    "parameters": parameters if 'parameters' in locals() else [],
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                with open("results/latest_query_result.json", "w") as f:
+                    json.dump(error_output, f, indent=2)
+                
+                print(f"❌ Query execution failed: {e}")
+                sys.exit(1)
+
+        if __name__ == "__main__":
+            query = sys.argv[1]
+            parameters = sys.argv[2] if len(sys.argv) > 2 else "[]"
+            execute_query("database/safari_project.db", query, parameters)
+        EOF
+        
+        # Python 스크립트 실행
+        python3 execute_query.py "${{ github.event.inputs.sql_query }}" "${{ github.event.inputs.parameters }}"
+
+    # 6. 데이터베이스 백업 (매일 스케줄 또는 수동 실행 시)
+    - name: 💾 Backup Database
+      if: github.event_name == 'schedule' || github.event.inputs.action_type == 'backup'
+      run: |
+        # 백업 파일명에 날짜 포함
+        BACKUP_DATE=$(date +%Y%m%d_%H%M%S)
+        BACKUP_FILE="backups/safari_project_${BACKUP_DATE}.db"
+        
+        if [ -f database/safari_project.db ]; then
+          cp database/safari_project.db "$BACKUP_FILE"
+          
+          # 압축하여 용량 절약
+          gzip "$BACKUP_FILE"
+          
+          echo "✅ Database backup created: ${BACKUP_FILE}.gz"
+          
+          # 30일 이상 된 백업 파일 삭제
+          find backups/ -name "*.gz" -mtime +30 -delete
+          echo "🧹 Old backups cleaned up"
+          
+          # 백업 로그 추가
+          sqlite3 database/safari_project.db << EOF
+          INSERT INTO sync_log (action, table_name, details) 
+          VALUES ('database_backup', 'system', 'Database backup created: ${BACKUP_FILE}.gz');
+        EOF
+        else
+          echo "⚠️ Database file not found for backup"
+        fi
+
+    # 7. 데이터베이스 통계 생성
+    - name: 📊 Generate Database Statistics
+      run: |
+        echo "Generating database statistics..."
+        
+        cat > generate_stats.py << 'EOF'
+        import sqlite3
+        import json
+        from datetime import datetime
+
+        def generate_stats():
+            conn = sqlite3.connect("database/safari_project.db")
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            stats = {
+                "generated_at": datetime.now().isoformat(),
+                "database_info": {},
+                "table_stats": {},
+                "status_breakdown": [],
+                "priority_breakdown": [],
+                "recent_activity": []
+            }
+            
+            try:
+                # 데이터베이스 기본 정보
+                cursor.execute("SELECT COUNT(*) as total FROM page_requests")
+                stats["database_info"]["total_page_requests"] = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT COUNT(*) as total FROM weekly_schedule") 
+                stats["database_info"]["total_weekly_items"] = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT COUNT(*) as total FROM sync_log")
+                stats["database_info"]["total_log_entries"] = cursor.fetchone()[0]
+                
+                # 상태별 통계
+                cursor.execute("""
+                    SELECT status, COUNT(*) as count 
+                    FROM page_requests 
+                    WHERE status IS NOT NULL 
+                    GROUP BY status 
+                    ORDER BY count DESC
+                """)
+                stats["status_breakdown"] = [dict(row) for row in cursor.fetchall()]
+                
+                # 우선순위별 통계
+                cursor.execute("""
+                    SELECT priority, COUNT(*) as count 
+                    FROM page_requests 
+                    WHERE priority IS NOT NULL 
+                    GROUP BY priority 
+                    ORDER BY count DESC
+                """)
+                stats["priority_breakdown"] = [dict(row) for row in cursor.fetchall()]
+                
+                # 최근 활동
+                cursor.execute("""
+                    SELECT action, table_name, details, timestamp
+                    FROM sync_log 
+                    ORDER BY timestamp DESC 
+                    LIMIT 10
+                """)
+                stats["recent_activity"] = [dict(row) for row in cursor.fetchall()]
+                
+                # 테이블별 통계
+                tables = ["page_requests", "weekly_schedule", "sync_log"]
+                for table in tables:
+                    cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
+                    count = cursor.fetchone()[0]
+                    
+                    cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")
+                    exists = cursor.fetchone() is not None
+                    
+                    stats["table_stats"][table] = {
+                        "exists": exists,
+                        "row_count": count
+                    }
+                
+            except Exception as e:
+                stats["error"] = str(e)
+            
+            finally:
+                conn.close()
+            
+            # 통계를 JSON 파일로 저장
+            with open("results/database_stats.json", "w") as f:
+                json.dump(stats, f, indent=2)
+            
+            print("📊 Database statistics generated successfully")
+
+        generate_stats()
+        EOF
+        
+        python3 generate_stats.py
+
+    # 8. 변경사항 커밋 및 푸시
+    - name: 💾 Commit and Push Changes
+      run: |
+        # Git 설정
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # 변경사항 확인
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "Changes detected, committing..."
+          
+          git add database/ results/ backups/
+          
+          # 커밋 메시지 생성
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            COMMIT_MSG="🔄 SQL query executed via Apps Script"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            COMMIT_MSG="💾 Scheduled database backup and stats update"
+          else
+            COMMIT_MSG="📊 Database files updated"
+          fi
+          
+          git commit -m "$COMMIT_MSG" -m "Automated commit from GitHub Actions"
+          git push
+          
+          echo "✅ Changes committed and pushed successfully"
+        else
+          echo "ℹ️ No changes to commit"
+        fi
+
+    # 9. 작업 완료 알림
+    - name: 🎉 Job Summary
+      run: |
+        echo "## 🗄️ SQLite Database Operations Complete" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f "results/latest_query_result.json" ]; then
+          echo "### 📊 Query Results" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          head -20 results/latest_query_result.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -f "results/database_stats.json" ]; then
+          echo "### 📈 Database Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          head -20 results/database_stats.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "### ⏰ Execution Time" >> $GITHUB_STEP_SUMMARY
+        echo "- Started: $(date -u)" >> $GITHUB_STEP_SUMMARY
+        echo "- Workflow: ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Trigger: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        
+        echo "✅ All database operations completed successfully!"
